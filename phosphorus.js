@@ -183,7 +183,7 @@ var P = (function() {
   };
 
   IO.LINE_HEIGHTS = {
-    Helvetica: 1.13,
+    'Helvetica': 1.13,
     'Donegal One': 1.25,
     'Gloria Hallelujah': 1.97,
     'Permanent Marker': 1.43,
@@ -413,18 +413,158 @@ var P = (function() {
     return request;
   };
 
+//Mittagskogel: I don't fully understand what is happening here,
+//so I have simply added the code by "htmlgames" (PF)
+// PF - New audio stuff ***
+
   IO.decodeAudio = function(ab, cb) {
     if (audioContext) {
-      audioContext.decodeAudioData(ab, function(buffer) {
-        cb(buffer);
-      }, function(err) {
-        console.warn('Failed to load audio');
-        cb(null);
-      });
+    // PF check buffer type is PCM or ADPCM 1st? (ie headers)
+	var abc = false;
+	var uInt8Array = new Uint8Array(ab);
+	if (readBytes(20, 2, uInt8Array) == 17) { // 11 hex (needs to be 1)
+		console.warn('Processing audio conversion');
+      		// PF it's most likely ADPCM - lets hack the header and correct the buffer
+		abc = readADPCM(uInt8Array);
+	}
+        if (abc) { // new
+	  audioContext.decodeAudioData(abc, function(buffer) {
+          cb(buffer);
+          }, function(err) {
+          console.warn('Failed to convert audio');
+          cb(null);
+          });
+	} else { // old
+	  audioContext.decodeAudioData(ab, function(buffer) {
+          cb(buffer);
+          }, function(err) {
+          console.warn('Failed to load audio');
+          cb(null);
+          });
+	}
     } else {
       setTimeout(cb);
     }
   };
+
+// helper function
+function readBytes(start, length, uInt8Array) {
+	var returnval = 0;
+	for (var j = 0; j < length; j++) {
+		returnval += uInt8Array[start + j] << (8 * j);
+	}
+	return returnval;
+}
+
+function readADPCM(uInt8Array) {
+
+	var blockAlign = readBytes(32, 2, uInt8Array);
+	var samplesPerBlock = (blockAlign - 4);
+	var sampleRate = readBytes(24, 4, uInt8Array);
+
+	var offset = (readBytes(20, 2, uInt8Array) != 1) ? 38 + readBytes(36, 2, uInt8Array) : 36;
+	offset += 8 + readBytes(offset + 4, 4, uInt8Array);
+
+	var soundBytes = readBytes(offset + 4, 4, uInt8Array);
+	var nBlocks = soundBytes / blockAlign;
+	offset += 8;
+
+	var resultStepChange = [-1, -1, -1, -1, 2, 4, 6, 8, -1, -1, -1, -1, 2, 4, 6, 8];
+	var stepSizes = [7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 19, 21, 23, 25, 28, 31, 34, 37, 41, 45, 50, 55, 60, 66, 73, 80, 88, 97, 107, 118, 130, 143, 157, 173, 190, 209, 230, 253, 279, 307, 337, 371, 408, 449, 494, 544, 598, 658, 724, 796, 876, 963, 1060, 1166, 1282, 1411, 1552, 1707, 1878, 2066, 2272, 2499, 2749, 3024, 3327, 3660, 4026, 4428, 4871, 5358, 5894, 6484, 7132, 7845, 8630, 9493, 10442, 11487, 12635, 13899, 15289, 16818, 18500, 20350, 22385, 24623, 27086, 29794, 32767];
+
+	var stepID = 8;
+	var step = 16;
+	var volume = 0;
+	var sdi = 0;
+	var in_s;
+	var s = 0;
+	var byte;
+	var nib;
+	var diff;
+
+	var length = (samplesPerBlock * 4 + 2) * nBlocks;
+	var soundBuf = new ArrayBuffer(length + 32);
+	var soundData = new Uint8Array(soundBuf, 32, length);
+
+	for (var b = 0; b < nBlocks; b++)
+	{
+		in_s = s;
+
+		volume = readBytes(s + offset, 2, uInt8Array)
+		if (volume > 32767) volume = (volume - 65536);
+		stepID = Math.max(0, Math.min(readBytes(s + offset + 2, 1, uInt8Array), 88));
+		s += 4;
+
+		var sample = Math.round(volume);
+		if (sample < 0) sample += 65536; // 2's complement signed
+
+		soundData[sdi++] = sample % 256;
+		soundData[sdi++] = Math.floor(sample / 256);
+
+		for (var as = 0; as < samplesPerBlock; as++)
+		{
+			byte = uInt8Array[s + offset].toString(2);
+			while (byte.length < 8) {
+				byte = "0" + byte;
+			}
+
+			for (var nibble = 0; nibble < 2; nibble++)
+			{
+				nib = parseInt(byte.substr(nibble*4, 4), 2);
+				nib &= 15;
+				step = stepSizes[stepID];
+				diff = step >> 3;
+				if (nib & 1) diff += step >> 2;
+				if (nib & 2) diff += step >> 1;
+				if (nib & 4) diff += step;
+				if (nib & 8) diff = 0 - diff;
+				volume = Math.max(Math.min(32767, volume + diff), -32768)
+				var sample = Math.round(volume);
+				if (sample < 0) sample += 65536; // 2's complement signed
+				soundData[sdi++] = sample % 256;
+				soundData[sdi++] = Math.floor(sample / 256);
+				stepID = Math.max(0, Math.min(stepID + resultStepChange[nib], 88));
+			}
+			s += 1;
+		}
+		s = in_s + blockAlign;
+	}
+
+	return encodeAudio16bit(soundData, sampleRate, soundBuf);
+}
+
+function encodeAudio16bit(soundData, sampleRate, soundBuf) {
+
+	// 16-bit mono WAVE header template
+	var header = "RIFF<##>WAVEfmt \x10\x00\x00\x00\x01\x00\x01\x00<##><##>\x02\x00\x10\x00data<##>";
+
+	// Helper to insert a 32-bit little endian int.
+	function insertLong(value) {
+		var bytes = "";
+		for (var i = 0; i < 4; ++i) {
+			bytes += String.fromCharCode(value % 256);
+			value = Math.floor(value / 256);
+		}
+		header = header.replace('<##>', bytes);
+	}
+
+	var n = soundData.length / 2; // as buffer
+	insertLong(36 + n * 2); // ChunkSize
+	insertLong(sampleRate); // SampleRate
+	insertLong(sampleRate * 2); // ByteRate
+	insertLong(n * 2); // Subchunk2Size
+
+	// Output sound data
+	var bytes = new Uint8Array(soundBuf, 0, 40); // 32
+	for (var i = 0; i < header.length; i++)
+	{
+  		bytes[i] = header.charCodeAt(i);
+	}
+	console.log(new Uint8Array(soundBuf));
+	return soundBuf.slice(0);      
+}
+
+// PF end of New audio stuff ***
 
   IO.loadBase = function(data) {
     data.scripts = data.scripts || [];
@@ -466,9 +606,23 @@ var P = (function() {
   };
 
   IO.fixSVG = function(svg, element) {
-    if (element.nodeType !== 1) return;
+    if (element.nodeType !== 1) return element;
+    if (element.nodeName.slice(0, 4).toLowerCase() === 'svg:') {
+      var newElement = document.createElementNS('http://www.w3.org/2000/svg', element.localName);
+      var attributes = element.attributes;
+      var newAttributes = newElement.attributes;
+      for (var i = attributes.length; i--;) {
+        newAttributes.setNamedItemNS(attributes[i].cloneNode());
+      }
+      while (element.firstChild) {
+        newElement.appendChild(element.firstChild);
+      }
+      element = newElement;
+    }
     if (element.nodeName === 'text') {
+      
       var font = element.getAttribute('font-family') || '';
+      
       font = IO.FONTS[font] || font;
       if (font) {
         element.setAttribute('font-family', font);
@@ -478,11 +632,11 @@ var P = (function() {
       if (!size) {
         element.setAttribute('font-size', size = 18);
       }
-      var bb = element.getBBox();
-      var x = 4 - .6 * element.transform.baseVal.consolidate().matrix.a;
-      var y = (element.getAttribute('y') - bb.y) * 1.1;
-      element.setAttribute('x', x);
-      element.setAttribute('y', y);
+
+      //TODO: Find out what actual values have to be put here.
+      element.setAttribute('x', 0);
+      element.setAttribute('y', size*IO.LINE_HEIGHTS[font]);
+      
       var lines = element.textContent.split('\n');
       if (lines.length > 1) {
         element.textContent = lines[0];
@@ -490,18 +644,74 @@ var P = (function() {
         for (var i = 1, l = lines.length; i < l; i++) {
           var tspan = document.createElementNS(null, 'tspan');
           tspan.textContent = lines[i];
-          tspan.setAttribute('x', x);
-          tspan.setAttribute('y', y + size * i * lineHeight);
+          tspan.setAttribute('x', 0);
+          tspan.setAttribute('y', size*(i+1)*lineHeight);//y + size * i * lineHeight);
+          tspan.setAttribute('id', 'ID' + Math.random());
           element.appendChild(tspan);
         }
       }
+      
       // svg.style.cssText = '';
       // console.log(element.textContent, 'data:image/svg+xml;base64,' + btoa(svg.outerHTML));
     } else if ((element.hasAttribute('x') || element.hasAttribute('y')) && element.hasAttribute('transform')) {
       element.setAttribute('x', 0);
       element.setAttribute('y', 0);
     }
-    [].forEach.call(element.childNodes, IO.fixSVG.bind(null, svg));
+    
+    if (element.nodeName === 'linearGradient'){
+      element.setAttribute('id', element.getAttribute('id') + svg.getAttribute('id'));
+      
+      if(element.getAttribute('gradientUnits')){
+        element.setAttribute('gradientUnits', 'objectBoundingBox');
+        //I really don't know what kind of algorithm scratch is following here, so this is just guesswork.
+        var x1 = Number(element.getAttribute('x1'));
+        var x2 = Number(element.getAttribute('x2'));
+        var y1 = Number(element.getAttribute('y1'));
+        var y2 = Number(element.getAttribute('y2'));
+        
+        if(x1 === x2){
+          x1 = 0;
+          x2 = 0;
+        }
+        else if(x1 < x2){
+          x1 = 0;
+          x2 = 1;
+        }
+        else{
+          x1 = 1;
+          x2 = 0;
+        }
+        if(y1 === y2){
+          y1 = 0;
+          y2 = 0;
+        }
+        else if(y1 < y2){
+          y1 = 0;
+          y2 = 1;
+        }
+        else{
+          y1 = 1;
+          y2 = 0;
+        }
+        
+        element.setAttribute('x1', x1);
+        element.setAttribute('x2', x2);
+        element.setAttribute('y1', y1);
+        element.setAttribute('y2', y2);
+      }
+    }
+    
+    if (element.getAttribute('fill') ? element.getAttribute('fill').indexOf("url") > -1 : false){
+      element.setAttribute('fill', element.getAttribute('fill').replace(/.$/, svg.getAttribute('id')));
+    }
+    
+    [].forEach.call(element.childNodes, function(child){
+	  var newChild = IO.fixSVG(svg, child);
+      if (newChild !== child) {
+        element.replaceChild(newChild, child);
+      }
+	});
+	return element;
   };
 
   IO.loadMD5 = function(md5, id, callback, isAudio) {
@@ -513,40 +723,75 @@ var P = (function() {
     if (ext === 'svg') {
       var cb = function(source) {
         var div = document.createElement('div');
-        div.innerHTML = source;
-        var svg = div.getElementsByTagName('svg')[0];
-        svg.style.visibility = 'hidden';
-        svg.style.position = 'absolute';
-        svg.style.left = '-10000px';
-        svg.style.top = '-10000px';
+        //div.innerHTML = source;
+        //var svg = div.getElementsByTagName('svg')[0];
+        //div.innerHTML = source.replace(/(<\/?)svg:/g, '$1');
+        //var svg = div.firstElementChild;		
+        var svg = new DOMParser().parseFromString(source, 'image/svg+xml').firstElementChild;
+        svg.id = 'svg' + Math.random();
+        if(svg.getAttribute('width') === '0' || svg.getAttribute('height') === '0'){
+          svg = document.createElementNS('http://www.w3.org/2000/svg', svg.localName);
+        }
+        else svg = IO.fixSVG(svg, svg);
+        
+        //svg.style.visibility = 'hidden';
+        //svg.style.position = 'absolute';
+        //svg.style.left = '-10000px';
+        //svg.style.top = '-10000px';
+   
+        //SVG is downright ignoring everything I try to do, so I simply give up. I've tried to fix this and am extremely frustrated because not even the most simple things will work. Either I am completely stupid, or the way svg behaves is linked to a random number generator controlled by Donald Trump. Either way. I GIVE UP. Whatever works, works, and the rest; I don't care.
+        
         document.body.appendChild(svg);
+        
         var viewBox = svg.viewBox.baseVal;
+        
         if (viewBox && (viewBox.x || viewBox.y)) {
-          svg.width.baseVal.value = viewBox.width - viewBox.x;
-          svg.height.baseVal.value = viewBox.height - viewBox.y;
+          //svg.width.baseVal.value = viewBox.width - viewBox.x;
+          //svg.height.baseVal.value = viewBox.height - viewBox.y;
+          //viewBox.x = 0;
+          //viewBox.y = 0;
+          //viewBox.width = 0;
+          //viewBox.height = 0;
+          var bb = svg.getBBox();
+          viewBox.width  = svg.width.baseVal.value = Math.ceil(bb.x + bb.width + 1);
+          viewBox.height = svg.height.baseVal.value = Math.ceil(bb.y + bb.height + 1);		       
           viewBox.x = 0;
           viewBox.y = 0;
-          viewBox.width = 0;
-          viewBox.height = 0;
         }
-        IO.fixSVG(svg, svg);
-        while (div.firstChild) div.removeChild(div.lastChild);
-        div.appendChild(svg);
-        svg.style.visibility = 'visible';
 
-        var canvas = document.createElement('canvas');
+        //IO.fixSVG(svg, svg);
+        //while (div.firstChild) div.removeChild(div.lastChild);
+        //div.appendChild(svg);
+        //svg.style.visibility = 'visible';
+        //svg.style.cssText = '';
+        
+        svg.style['image-rendering'] = '-moz-crisp-edges';
+        svg.style['image-rendering'] = 'pixelated';
+        
+        //svg.style.overflow = 'visible';
+        //svg.style.width = '100%';
+        
+        var request = new Request;
         var image = new Image;
-        callback(image);
-        // svg.style.cssText = '';
-        // console.log(md5, 'data:image/svg+xml;base64,' + btoa(div.innerHTML.trim()));
-        canvg(canvas, div.innerHTML.trim(), {
-          ignoreMouse: true,
-          ignoreAnimation: true,
-          ignoreClear: true,
-          renderCallback: function() {
-            image.src = canvas.toDataURL();
-          }
-        });
+
+        var newSource = (new XMLSerializer()).serializeToString(svg)
+        //svg.id = 'svg' + Math.random();
+        // console.log(md5, 'data:image/svg+xml;base64,' + btoa(source), 'data:image/svg+xml;base64,' + btoa(newSource));
+        image.src = 'data:image/svg+xml;base64,' + btoa(newSource); 
+        
+        svg.style.display = 'none';
+        
+        image.onload = function() {
+          if (callback) callback(image);
+          request.load();
+        };
+        image.onerror = function(e) {
+          //console.error(e, image);
+          //console.log(image.src);
+          console.error(md5, image.src);
+          request.error(new Error());
+        };
+        IO.projectRequest.add(request);		
       };
       if (IO.zip) {
         cb(f.asText());
@@ -715,7 +960,7 @@ var P = (function() {
   };
 
   Base.prototype.setCostume = function(costume) {
-    if (typeof costume !== 'number') {
+    if (isNaN(parseInt(costume))){//typeof costume !== 'number') {
       costume = '' + costume;
       for (var i = 0; i < this.costumes.length; i++) {
         if (this.costumes[i].costumeName === costume) {
@@ -733,12 +978,13 @@ var P = (function() {
         this.showPreviousCostume();
         return;
       }
-    }
-    var i = (Math.floor(costume) - 1 || 0) % this.costumes.length;
+      return;
+    } 
+    var i = (Math.floor(parseInt(costume)) - 1) % this.costumes.length;
     if (i < 0) i += this.costumes.length;
-    this.currentCostumeIndex = i;
-    if (this.isStage) this.updateBackdrop();
-    if (this.saying) this.updateBubble();
+		this.currentCostumeIndex = i;
+		if (this.isStage) this.updateBackdrop();
+		if (this.saying) this.updateBubble();
   };
 
   Base.prototype.setFilter = function(name, value) {
@@ -747,6 +993,7 @@ var P = (function() {
     switch (name) {
       case 'whirl':
       case 'fisheye':
+      case 'brightness':
       case 'pixelate': // absolute value
       case 'mosaic': // absolute value
         min = -Infinity;
@@ -760,6 +1007,7 @@ var P = (function() {
     }
     if (value < min) value = min;
     if (value > max) value = max;
+    value = Math.min(max, Math.max(min, value));
     this.filters[name] = value;
     if (this.isStage) this.updateFilters();
   };
@@ -881,7 +1129,7 @@ var P = (function() {
     this.penContext = this.penCanvas.getContext('2d');
     this.penContext.lineCap = 'round';
     this.penContext.scale(SCALE, SCALE);
-
+    
     this.canvas = document.createElement('canvas');
     this.root.appendChild(this.canvas);
     this.canvas.width = SCALE * 480;
@@ -893,11 +1141,11 @@ var P = (function() {
     this.backdropCanvas.style.position =
     this.penCanvas.style.position =
     this.canvas.style.position = 'absolute';
-    this.backdropCanvas.style.width =
-    this.penCanvas.style.width =
+    this.backdropCanvas.style.width = '480px';
+    this.penCanvas.style.width = '480px';
     this.canvas.style.width = '480px';
-    this.backdropCanvas.style.height =
-    this.penCanvas.style.height =
+    this.backdropCanvas.style.height = '360px';
+    this.penCanvas.style.height = '360px';
     this.canvas.style.height = '360px';
 
     // hardware acceleration
@@ -924,8 +1172,9 @@ var P = (function() {
         e.preventDefault();
       }
     }.bind(this));
-
-    if (hasTouchEvents) {
+	
+	//Changed this to include both event listeners, otherwise Hybrid laptops may not work. Possibly add extra option for hybrids instead.
+    //if (hasTouchEvents) {
 
       document.addEventListener('touchstart', function(e) {
         this.mousePressed = true;
@@ -946,7 +1195,7 @@ var P = (function() {
         this.releaseMouse();
       }.bind(this));
 
-    } else {
+    //} else {
 
       document.addEventListener('mousedown', function(e) {
         this.updateMouse(e);
@@ -967,7 +1216,7 @@ var P = (function() {
         this.updateMouse(e);
         this.releaseMouse();
       }.bind(this));
-    }
+    //}
 
     this.prompter = document.createElement('div');
     this.root.appendChild(this.prompter);
@@ -1080,7 +1329,7 @@ var P = (function() {
     this.backdropContext.save();
     var s = this.zoom * SCALE * costume.scale;
     this.backdropContext.scale(s, s);
-    this.backdropContext.drawImage(costume.image, 0, 0);
+    this.backdropContext.drawImage(costume.image, 0, 0, costume.image.width/costume.resScale, costume.image.height/costume.resScale);
     this.backdropContext.restore();
   };
 
@@ -1262,7 +1511,8 @@ var P = (function() {
     this.spriteInfo = {};
     this.visible = true;
 
-    this.penHue = 240;
+    this.Hue = 240;
+    this.penHue = 250;
     this.penSaturation = 100;
     this.penLightness = 50;
 
@@ -1376,7 +1626,7 @@ var P = (function() {
     if (ox === x && oy === y && !this.isPenDown) return;
     this.scratchX = x;
     this.scratchY = y;
-    if (this.isPenDown) {
+    if (this.isPenDown && !this.isDragging) {
       var context = this.stage.penContext;
       if (this.penSize % 2 > .5 && this.penSize % 2 < 1.5) {
         ox -= .5;
@@ -1384,12 +1634,13 @@ var P = (function() {
         x -= .5;
         y -= .5;
       }
+
       context.strokeStyle = this.penCSS || 'hsl(' + this.penHue + ',' + this.penSaturation + '%,' + (this.penLightness > 100 ? 200 - this.penLightness : this.penLightness) + '%)';
       context.lineWidth = this.penSize;
       context.beginPath();
       context.moveTo(240 + ox, 180 - oy);
       context.lineTo(240 + x, 180 - y);
-      context.stroke();
+      context.stroke();    
     }
     if (this.saying) {
       this.updateBubble();
@@ -1401,14 +1652,20 @@ var P = (function() {
     var x = this.scratchX;
     var y = this.scratchY;
     context.fillStyle = this.penCSS || 'hsl(' + this.penHue + ',' + this.penSaturation + '%,' + (this.penLightness > 100 ? 200 - this.penLightness : this.penLightness) + '%)';
-    context.beginPath();
+
+	//if(this.penSize <= 2 * 480 / this.stage.penCanvas.width){
+	//  context.fillRect(240 + x - this.penSize, 180 - y, this.penSize, this.penSize);
+	//}
+	//else{
+	  context.beginPath();
     context.arc(240 + x, 180 - y, this.penSize / 2, 0, 2 * Math.PI, false);
     context.fill();
+	//}
   };
 
   Sprite.prototype.draw = function(context, noEffects) {
     var costume = this.costumes[this.currentCostumeIndex];
-
+    
     if (this.isDragging) {
       this.moveTo(this.dragOffsetX + this.stage.mouseX, this.dragOffsetY + this.stage.mouseY);
     }
@@ -1427,9 +1684,175 @@ var P = (function() {
       context.scale(costume.scale, costume.scale);
       context.translate(-costume.rotationCenterX, -costume.rotationCenterY);
 
-      if (!noEffects) context.globalAlpha = Math.max(0, Math.min(1, 1 - this.filters.ghost / 100));
+      if (!noEffects) context.globalAlpha = Math.max(0, Math.min(1, 1 - this.filters.ghost / 100));    
+      
+      //TODO: General Optimization
+      if(this.filters.pixelate !== 0 || this.filters.mosaic !== 0 || this.filters.mosaic !== 0){
 
-      context.drawImage(costume.image, 0, 0);
+        var effectsCanvas = document.createElement('canvas');
+        effectsCanvas.width = costume.image.width;
+        effectsCanvas.height = costume.image.height;
+        var effectsContext = effectsCanvas.getContext('2d');
+        document.body.appendChild(effectsCanvas);      
+ 
+        effectsContext.drawImage(costume.image, 0, 0, effectsCanvas.width, effectsCanvas.height);       
+      
+        /*
+        //color
+        //I don't know how to do this (yet).
+        
+        //canvas for color overlay
+        var colorCanvas = document.createElement('canvas');
+        colorCanvas.width = 1;
+        colorCanvas.height = 1;
+        var colorContext = colorCanvas.getContext('2d');
+        document.body.appendChild(colorCanvas);
+        
+        var costumeCanvas = document.createElement('canvas');
+        costumeCanvas.width = costume.image.width;
+        costumeCanvas.height = costume.image.height;
+        var costumeContext = costumeCanvas.getContext('2d');
+        document.body.appendChild(costumeCanvas); 
+        
+        //create new object instead of reading? 
+        var imgData = colorContext.getImageData(0, 0, 1, 1);
+        
+        var colorVal = this.filters.color/200;
+        
+        imgData.data[0] = (Math.min(2, Math.max(1, Math.abs((colorVal%1)*2-1)*3))-1)*255;
+        imgData.data[1] = (Math.min(2, Math.max(1, Math.abs(((colorVal+2/3)%1)*2-1)*3))-1)*255;
+        imgData.data[2] = (Math.min(2, Math.max(1, Math.abs(((colorVal+1/3)%1)*2-1)*3))-1)*255;
+        imgData.data[3] = 255;     
+        
+        colorContext.putImageData(imgData, 0, 0);
+        
+        costumeContext.drawImage(costume.image, 0, 0);
+        costumeContext.globalCompositeOperation = 'color';
+        costumeContext.drawImage(colorCanvas, 0, 0, 1000, 1000);
+        costumeContext.globalCompositeOperation = 'destination-in';
+        costumeContext.drawImage(costume.image, 0, 0);       
+
+        context.drawImage(costumeCanvas, 0, 0);
+      
+        colorCanvas.parentNode.removeChild(colorCanvas);
+        costumeCanvas.parentNode.removeChild(costumeCanvas);           
+        */
+      
+        
+        if(this.filters.pixelate !== 0){
+        
+        var pixelCanvas = document.createElement('canvas');
+        pixelCanvas.width = 10*effectsCanvas.width/(this.filters.pixelate + effectsCanvas.width/10);
+        pixelCanvas.height = 10*effectsCanvas.height/(this.filters.pixelate + effectsCanvas.height/10);
+        var pixelContext = pixelCanvas.getContext('2d');
+        document.body.appendChild(pixelCanvas);   
+        
+        var costumeCanvas = document.createElement('canvas');
+        costumeCanvas.width = effectsCanvas.width;
+        costumeCanvas.height = effectsCanvas.height;
+        var costumeContext = costumeCanvas.getContext('2d');
+        document.body.appendChild(costumeCanvas);    
+
+        pixelContext.drawImage(effectsCanvas, 0, 0, pixelCanvas.width, pixelCanvas.height);
+        
+        costumeContext.imageSmoothingEnabled = false;
+        costumeContext.mozImageSmoothingEnabled = false;
+        costumeContext.drawImage(pixelCanvas, 0, 0, costumeCanvas.width, costumeCanvas.height);
+        
+        effectsContext.clearRect(0, 0, effectsCanvas.width, effectsCanvas.height);       
+        effectsContext.drawImage(costumeCanvas, 0, 0);
+        
+        pixelCanvas.parentNode.removeChild(pixelCanvas);
+        costumeCanvas.parentNode.removeChild(costumeCanvas);
+        }
+        
+        ///////
+        
+        if(this.filters.mosaic !== 0){
+        var costumeCanvas = document.createElement('canvas');
+        costumeCanvas.width = effectsCanvas.width;
+        costumeCanvas.height = effectsCanvas.height;
+        var costumeContext = costumeCanvas.getContext('2d');
+        document.body.appendChild(costumeCanvas);     
+        
+        var mosaicVal = Math.floor((Math.abs(this.filters.mosaic)+5)/10)+1;
+        
+        var lineCanvas = document.createElement('canvas');
+        lineCanvas.width = effectsCanvas.width/mosaicVal;
+        lineCanvas.height = effectsCanvas.height;
+        var lineContext = lineCanvas.getContext('2d');
+        document.body.appendChild(lineCanvas);        
+                
+        for(var i = 0; i < mosaicVal; i++){
+           lineContext.drawImage(effectsCanvas, 0, i*costumeCanvas.height/mosaicVal, costumeCanvas.width/mosaicVal, costumeCanvas.height/mosaicVal);
+        }           
+                
+        for(var i = 0; i < mosaicVal; i++){
+           costumeContext.drawImage(lineCanvas, i*costumeCanvas.width/mosaicVal, 0, costumeCanvas.width/mosaicVal, costumeCanvas.height);
+        }
+        
+        effectsContext.clearRect(0, 0, effectsCanvas.width, effectsCanvas.height);
+        effectsContext.drawImage(costumeCanvas, 0, 0);
+        
+        costumeCanvas.parentNode.removeChild(costumeCanvas);
+        lineCanvas.parentNode.removeChild(lineCanvas);
+        }
+        
+        ///////
+        
+        if(this.filters.brightness !== 0){
+        //canvas for brightness overlay
+        //TODO: Find out why brightness doesn't always match scratch.
+        var brightnessCanvas = document.createElement('canvas');
+        brightnessCanvas.width = 1;
+        brightnessCanvas.height = 1;
+        var brightnessContext = brightnessCanvas.getContext('2d');
+        document.body.appendChild(brightnessCanvas);
+        
+        var costumeCanvas = document.createElement('canvas');
+        costumeCanvas.width = effectsCanvas.width;
+        costumeCanvas.height = effectsCanvas.height;
+        var costumeContext = costumeCanvas.getContext('2d');
+        document.body.appendChild(costumeCanvas); 
+        
+        var imgData = brightnessContext.getImageData(0, 0, 1, 1);
+        
+        var brightnessVal = this.filters.brightness * 255 / 101;
+        
+        if(brightnessVal < 0) brightnessVal = -255 - brightnessVal;
+        
+        imgData.data[0] =
+        imgData.data[1] =
+        imgData.data[2] = Math.abs(brightnessVal);
+        imgData.data[3] = 255;     
+        
+        brightnessContext.putImageData(imgData, 0, 0);
+        
+        if(brightnessVal < 0){
+           costumeContext.drawImage(brightnessCanvas, 0, 0, costumeCanvas.width, costumeCanvas.height);
+           costumeContext.globalCompositeOperation = 'destination-in';
+           costumeContext.drawImage(effectsCanvas, 0, 0);
+           costumeContext.globalCompositeOperation = 'multiply';
+           costumeContext.drawImage(effectsCanvas, 0, 0);
+        }
+        else{
+           costumeContext.drawImage(effectsCanvas, 0, 0);      
+           costumeContext.globalCompositeOperation = 'lighter';  
+           costumeContext.drawImage(brightnessCanvas, 0, 0, costumeCanvas.width, costumeCanvas.height);
+           costumeContext.globalCompositeOperation = 'destination-in';
+           costumeContext.drawImage(effectsCanvas, 0, 0);
+        }
+        effectsContext.drawImage(costumeCanvas, 0, 0);
+      
+        brightnessCanvas.parentNode.removeChild(brightnessCanvas);
+        costumeCanvas.parentNode.removeChild(costumeCanvas);            
+        }
+        
+        context.drawImage(effectsCanvas, 0, 0, costume.image.width/costume.resScale, costume.image.height/costume.resScale);
+        
+        effectsCanvas.parentNode.removeChild(effectsCanvas);
+      }
+      else context.drawImage(costume.image, 0, 0, costume.image.width/costume.resScale, costume.image.height/costume.resScale);
 
       context.restore();
     }
@@ -1467,7 +1890,7 @@ var P = (function() {
       } else if (this.rotationStyle === 'leftRight' && this.direction < 0) {
         cx = -cx
       }
-      var d = costume.context.getImageData(cx * costume.bitmapResolution + costume.rotationCenterX, cy * costume.bitmapResolution + costume.rotationCenterY, 1, 1).data;
+      var d = costume.context.getImageData(cx * costume.resScale * costume.bitmapResolution + costume.rotationCenterX * costume.resScale, cy * costume.resScale * costume.bitmapResolution + costume.rotationCenterY * costume.resScale, 1, 1).data;
       return d[3] !== 0;
     } else if (thing === '_edge_') {
       var bounds = this.rotatedBounds();
@@ -1761,6 +2184,9 @@ var P = (function() {
   };
 
   var Costume = function(data, index, base) {
+    
+    //var lol = document.body.style.width;
+    
     this.index = index;
     this.base = base;
     this.baseLayerID = data.baseLayerID;
@@ -1772,7 +2198,8 @@ var P = (function() {
     this.rotationCenterX = data.rotationCenterX;
     this.rotationCenterY = data.rotationCenterY;
     this.textLayer = data.$text;
-
+    this.resScale = Math.pow(2, Math.floor(Math.log((P.resolution || 960)/481)/Math.log(2)))*2;
+    
     this.image = document.createElement('canvas');
     this.context = this.image.getContext('2d');
 
@@ -1790,12 +2217,18 @@ var P = (function() {
     if (!this.baseLayer.width || this.textLayer && !this.textLayer.width) {
       return;
     }
-    this.image.width = this.baseLayer.width;
-    this.image.height = this.baseLayer.height;
-
-    this.context.drawImage(this.baseLayer, 0, 0);
+    
+    this.image.width = this.baseLayer.width*this.resScale;
+    this.image.height = this.baseLayer.height*this.resScale;
+    
+    this.context.mozImageSmoothingEnabled = false;
+    this.context.imageSmoothingEnabled = false;
+    this.context.msImageSmoothingEnabled = false;
+    this.context.webkitImageSmoothingEnabled = false;
+    
+    this.context.drawImage(this.baseLayer, 0, 0, this.image.width, this.image.height);
     if (this.textLayer) {
-      this.context.drawImage(this.textLayer, 0, 0);
+      this.context.drawImage(this.textLayer, 0, 0, this.image.width, this.image.height);
     }
     if (this.base.isStage && this.index == this.base.currentCostumeIndex) {
       setTimeout(function() {
@@ -1958,7 +2391,8 @@ var P = (function() {
 
     context.save();
     context.translate(this.x, this.y);
-
+	
+	//drawing variables in here?
     if (this.mode === 1 || this.mode === 3) {
       context.font = 'bold 11px sans-serif';
 
@@ -2080,11 +2514,11 @@ var P = (function() {
     Watcher: Watcher
   };
 
-}());
+  }());
 
 P.compile = (function() {
   'use strict';
-
+  
   var LOG_PRIMITIVES;
   var DEBUG;
   // LOG_PRIMITIVES = true;
@@ -2797,6 +3231,7 @@ P.compile = (function() {
       } else if (block[0] === 'putPenUp') {
 
         source += 'S.isPenDown = false;\n';
+        source += 'S.dotPen();\n';
         source += 'S.penState = null;\n';
 
       } else if (block[0] === 'penColor:') {
@@ -2813,7 +3248,7 @@ P.compile = (function() {
         source += 'S.penSaturation = 100;\n';
 
       } else if (block[0] === 'changePenHueBy:') {
-
+        
         source += noRGB;
         source += 'S.penHue += ' + num(block[1]) + ' * 360 / 200;\n';
         source += 'S.penSaturation = 100;\n';
@@ -3216,7 +3651,7 @@ P.compile = (function() {
     warnings = Object.create(null);
 
     compileScripts(stage);
-
+    
     for (var i = 0; i < stage.children.length; i++) {
       if (!stage.children[i].cmd) {
         compileScripts(stage.children[i]);
@@ -3226,7 +3661,6 @@ P.compile = (function() {
     for (var key in warnings) {
       console.warn(key + (warnings[key] > 1 ? ' (repeated ' + warnings[key] + ' times)' : ''));
     }
-
   };
 
 }());
@@ -3602,6 +4036,7 @@ P.runtime = (function() {
     };
   }
 
+  //these are javascript internal functions... what are they doing here???
   var save = function() {
     STACK.push(R);
     R = {};

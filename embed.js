@@ -6,20 +6,25 @@
   })(document.getElementsByTagName('script'));
 
   var hasUI = true;
+  var resolution = 480;
   var params = script.src.split('?')[1].split('&');
   params.forEach(function(p) {
     var parts = p.split('=');
     if (parts.length > 1 && parts[0] === 'ui') {
       hasUI = parts[1] !== 'false';
     }
+    if (parts.length > 1 && parts[0] === 'resolution-x'){
+      resolution = parts[1];
+    }
   });
-
+  
   var iframe = document.createElement('iframe');
   iframe.setAttribute('allowfullscreen', true);
   iframe.setAttribute('allowtransparency', true);
   iframe.src = script.src.replace(/^https:/, 'http:').replace(/embed\.js/, 'embed.html');
-  iframe.width = hasUI ? 482 : 480;
-  iframe.height = hasUI ? 393 : 360;
+  //width: 482, height: 393
+  iframe.width = hasUI ? Number(resolution)+2 : resolution;
+  iframe.height = hasUI ? Number(resolution)*3/4+33 : resolution*3/4;
   iframe.style.border = '0';
   iframe.className = 'phosphorus';
 

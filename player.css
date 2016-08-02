@@ -103,8 +103,28 @@
 }
 .fs .controls span,
 .light-content .controls span {
-  background-position-y: -32px;
   opacity: .6;
+}
+.fs .controls  .flag,
+.light-content .controls .flag{
+  background-position: 0 -32px;
+}
+.fs .controls  .stop,
+.light-content .controls .stop{
+  background-position: -96px -32px;
+}
+.fs .controls  .pause,
+.light-content .controls .pause{
+  background-position: -32px -32px;
+}
+.fs .controls  .play,
+.light-content .controls .play{
+  background-position: -64px -32px;
+}
+.fs .controls  .full-screen,
+.light-content .controls .full-screen{
+  float: left;
+  background-position: -128px -32px;
 }
 .light-content .controls .full-screen {
   background-position-y: -64px;
